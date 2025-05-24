@@ -1,0 +1,20 @@
+{
+  "name": "rpc-load-balancer-proxy",
+  "version": "1.0.0",
+  "description": "RPC Load Balancer Proxy for Drosera",
+  "main": "rpc-proxy.js",
+  "scripts": {
+    "start": "node rpc-proxy.js",
+    "dev": "nodemon rpc-proxy.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-fetch": "^2.6.7"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.20"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
