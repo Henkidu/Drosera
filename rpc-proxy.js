@@ -7,59 +7,70 @@ class RPCLoadBalancer {
         this.providers = [
             {
                 name: 'QuickNode',
-                url: 'RPC-URL_1',
+                url: 'https://green-dry-isle.ethereum-holesky.quiknode.pro/af30a269bd83c815839fe50b377bac4a8ce43a51/',
                 rateLimit: 15, // req/sec
                 lastRequest: 0,
                 errorCount: 0,
                 maxErrors: 5,
-                priority: 1
+                priority: 1,
+                blockHeight: 0,
+                lastHealthCheck: 0
             },
             {
                 name: 'Alchemy',
-                url: 'RPC-URL_2',
+                url: 'https://eth-holesky.g.alchemy.com/v2/BrUxNlh7b1VUw6S_CZevib6nME3P0TSy',
                 rateLimit: 15, // req/sec
                 lastRequest: 0,
                 errorCount: 0,
                 maxErrors: 5,
-                priority: 1
+                priority: 1,
+                blockHeight: 0,
+                lastHealthCheck: 0
             },
             {
                 name: 'Ankr',
-                url: 'RPC-URL_3',
+                url: 'https://rpc.ankr.com/eth/997876ce79161756dceb7ee8f8a546481bd72d81b8fef18e9a801b9eca619608',
                 rateLimit: 20,
                 lastRequest: 0,
                 errorCount: 0,
                 maxErrors: 3,
-                priority: 3
+                priority: 3,
+                blockHeight: 0,
+                lastHealthCheck: 0
             },
             {
                 name: 'DRPC',
-                url: 'RPC-URL_4',
+                url: 'https://lb.drpc.org/ogrpc?network=holesky&dkey=AnD08YOrIEM8uzAD-bjc9DlucRpkOJoR8Kx_brRhIxXF',
                 rateLimit: 15,
                 lastRequest: 0,
                 errorCount: 0,
                 maxErrors: 3,
-                priority: 5
+                priority: 5,
+                blockHeight: 0,
+                lastHealthCheck: 0
             },
             {
                 name: 'Public_Panda',
-                url: 'RPC-URL_5',
+                url: 'https://rpc.holesky.ethpandaops.io',
                 rateLimit: 15,
                 lastRequest: 0,
                 errorCount: 0,
                 maxErrors: 3,
-                priority: 5
+                priority: 5,
+                blockHeight: 0,
+                lastHealthCheck: 0
             },
             {
-                name: 'Public_Thirdweb',
+                name: 'https://holesky.rpc.thirdweb.com',
                 url: 'RPC-URL_6',
                 rateLimit: 15,
                 lastRequest: 0,
                 errorCount: 0,
                 maxErrors: 3,
-                priority: 5
+                priority: 5,
+                blockHeight: 0,
+                lastHealthCheck: 0
             }
-
         ];
         
         this.requestStats = {
@@ -69,6 +80,14 @@ class RPCLoadBalancer {
             byProvider: {}
         };
         
+        // Sticky sessions per client IP
+        this.clientSessions = new Map();
+        this.sessionTimeout = 300000; // 5 minuti
+        
+        // Cache per richieste identiche
+        this.requestCache = new Map();
+        this.cacheTimeout = 10000; // 10 secondi
+        
         // Initialize stats
         this.providers.forEach(p => {
             this.requestStats.byProvider[p.name] = {
@@ -77,15 +96,187 @@ class RPCLoadBalancer {
                 failures: 0
             };
         });
+        
+        // Avvia health check periodico
+        this.startHealthCheck();
+        
+        // Pulisci cache periodicamente
+        this.startCacheCleanup();
     }
 
-    selectProvider() {
+    // Health check periodico per verificare sincronizzazione
+    async startHealthCheck() {
+        setInterval(async () => {
+            await this.checkAllProvidersHealth();
+        }, 30000); // Ogni 30 secondi
+    }
+
+    async checkAllProvidersHealth() {
+        const promises = this.providers.map(async (provider) => {
+            try {
+                const blockHeight = await this.getBlockHeight(provider);
+                if (blockHeight) {
+                    provider.blockHeight = blockHeight;
+                    provider.lastHealthCheck = Date.now();
+                }
+            } catch (error) {
+                console.warn(`Health check failed for ${provider.name}: ${error.message}`);
+            }
+        });
+        
+        await Promise.allSettled(promises);
+        
+        // Log dello stato di sincronizzazione
+        const heights = this.providers
+            .filter(p => p.blockHeight > 0)
+            .map(p => ({ name: p.name, height: p.blockHeight }));
+        
+        if (heights.length > 1) {
+            const maxHeight = Math.max(...heights.map(h => h.height));
+            const minHeight = Math.min(...heights.map(h => h.height));
+            
+            if (maxHeight - minHeight > 2) {
+                console.warn(`⚠️  Block height discrepancy: ${minHeight} - ${maxHeight}`);
+                heights.forEach(h => {
+                    if (maxHeight - h.height > 2) {
+                        console.warn(`📉 ${h.name} is ${maxHeight - h.height} blocks behind`);
+                    }
+                });
+            }
+        }
+    }
+
+    async getBlockHeight(provider) {
+        const response = await fetch(provider.url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                jsonrpc: '2.0',
+                method: 'eth_blockNumber',
+                params: [],
+                id: 1
+            }),
+            timeout: 5000
+        });
+        
+        const data = await response.json();
+        return data.result ? parseInt(data.result, 16) : null;
+    }
+
+    // Gestione sessioni sticky per client
+    getClientSession(clientIP) {
+        const now = Date.now();
+        const session = this.clientSessions.get(clientIP);
+        
+        if (session && (now - session.lastUsed) < this.sessionTimeout) {
+            session.lastUsed = now;
+            return session.providerIndex;
+        }
+        
+        // Crea nuova sessione
+        const availableProviders = this.providers
+            .map((p, index) => ({ provider: p, index }))
+            .filter(({ provider }) => provider.errorCount < provider.maxErrors)
+            .sort((a, b) => a.provider.priority - b.provider.priority);
+        
+        if (availableProviders.length === 0) return 0;
+        
+        const selectedIndex = availableProviders[0].index;
+        this.clientSessions.set(clientIP, {
+            providerIndex: selectedIndex,
+            lastUsed: now
+        });
+        
+        return selectedIndex;
+    }
+
+    // Cache per richieste identiche
+    getCacheKey(payload) {
+        // Cache solo per metodi "safe" che non cambiano stato
+        const cacheableMethods = [
+            'eth_blockNumber',
+            'eth_getBalance',
+            'eth_getTransactionCount',
+            'eth_getCode',
+            'eth_call'
+        ];
+        
+        if (!cacheableMethods.includes(payload.method)) {
+            return null;
+        }
+        
+        return JSON.stringify({
+            method: payload.method,
+            params: payload.params
+        });
+    }
+
+    getCachedResponse(cacheKey) {
+        if (!cacheKey) return null;
+        
+        const cached = this.requestCache.get(cacheKey);
+        if (!cached) return null;
+        
+        const now = Date.now();
+        if (now - cached.timestamp > this.cacheTimeout) {
+            this.requestCache.delete(cacheKey);
+            return null;
+        }
+        
+        return cached.response;
+    }
+
+    setCachedResponse(cacheKey, response) {
+        if (!cacheKey) return;
+        
+        this.requestCache.set(cacheKey, {
+            response: response,
+            timestamp: Date.now()
+        });
+    }
+
+    startCacheCleanup() {
+        setInterval(() => {
+            const now = Date.now();
+            for (const [key, value] of this.requestCache.entries()) {
+                if (now - value.timestamp > this.cacheTimeout) {
+                    this.requestCache.delete(key);
+                }
+            }
+            
+            // Pulisci anche sessioni scadute
+            for (const [clientIP, session] of this.clientSessions.entries()) {
+                if (now - session.lastUsed > this.sessionTimeout) {
+                    this.clientSessions.delete(clientIP);
+                }
+            }
+        }, 60000); // Ogni minuto
+    }
+
+    selectProvider(clientIP = null, preferSync = false) {
+        // Se abbiamo un client IP, usa sticky session
+        if (clientIP) {
+            const sessionIndex = this.getClientSession(clientIP);
+            const provider = this.providers[sessionIndex];
+            if (provider && provider.errorCount < provider.maxErrors) {
+                return provider;
+            }
+        }
+        
         const now = Date.now();
         
         // Filtra provider disponibili
-        const availableProviders = this.providers
+        let availableProviders = this.providers
             .filter(p => p.errorCount < p.maxErrors)
             .sort((a, b) => a.priority - b.priority);
+        
+        // Se richiesto, preferisci provider più sincronizzati
+        if (preferSync && availableProviders.length > 1) {
+            const maxHeight = Math.max(...availableProviders.map(p => p.blockHeight));
+            availableProviders = availableProviders.filter(p => 
+                p.blockHeight === 0 || maxHeight - p.blockHeight <= 1
+            );
+        }
         
         if (availableProviders.length === 0) {
             // Reset errori se tutti sono down
@@ -111,11 +302,28 @@ class RPCLoadBalancer {
         });
     }
 
-    async makeRequest(jsonrpcPayload, maxRetries = 3) {
+    async makeRequest(jsonrpcPayload, maxRetries = 3, clientIP = null) {
         this.requestStats.total++;
         
+        // Controlla cache
+        const cacheKey = this.getCacheKey(jsonrpcPayload);
+        const cachedResponse = this.getCachedResponse(cacheKey);
+        if (cachedResponse) {
+            console.log(`💾 Cache hit for ${jsonrpcPayload.method}`);
+            return { ...cachedResponse, id: jsonrpcPayload.id };
+        }
+        
+        // Determina se questa richiesta ha bisogno di sincronizzazione precisa
+        const syncCriticalMethods = [
+            'eth_getBlockByNumber',
+            'eth_getTransactionByHash',
+            'eth_getTransactionReceipt',
+            'eth_getLogs'
+        ];
+        const preferSync = syncCriticalMethods.includes(jsonrpcPayload.method);
+        
         for (let attempt = 0; attempt < maxRetries; attempt++) {
-            const provider = this.selectProvider();
+            const provider = this.selectProvider(clientIP, preferSync);
             const now = Date.now();
             
             // Rate limiting
@@ -147,15 +355,26 @@ class RPCLoadBalancer {
                 
                 const data = await response.json();
                 
-                if (data.error && data.error.code === -32007) {
-                    // Rate limit specifico, aspetta di più
-                    throw new Error(`Rate limit reached on ${provider.name}`);
+                if (data.error) {
+                    if (data.error.code === -32007 || data.error.message.includes('rate limit')) {
+                        throw new Error(`Rate limit reached on ${provider.name}`);
+                    }
+                    
+                    // Se è un errore RPC valido, non fare retry
+                    if (attempt === maxRetries - 1) {
+                        this.requestStats.successful++; // È tecnicamente una risposta valida
+                        this.requestStats.byProvider[provider.name].successes++;
+                        return data;
+                    }
                 }
                 
                 // Successo
                 provider.errorCount = Math.max(0, provider.errorCount - 1);
                 this.requestStats.successful++;
                 this.requestStats.byProvider[provider.name].successes++;
+                
+                // Salva in cache
+                this.setCachedResponse(cacheKey, data);
                 
                 console.log(`✅ [${provider.name}] ${jsonrpcPayload.method} successful`);
                 return data;
@@ -176,13 +395,15 @@ class RPCLoadBalancer {
                     throw error;
                 }
                 
-                // Breve pausa prima del retry
-                await new Promise(resolve => setTimeout(resolve, 500));
+                // Breve pausa prima del retry con backoff esponenziale
+                const backoffDelay = Math.min(1000 * Math.pow(2, attempt), 5000);
+                await new Promise(resolve => setTimeout(resolve, backoffDelay));
             }
         }
     }
 
     getHealthStatus() {
+        const now = Date.now();
         return {
             providers: this.providers.map(p => ({
                 name: p.name,
@@ -190,9 +411,17 @@ class RPCLoadBalancer {
                 errorCount: p.errorCount,
                 maxErrors: p.maxErrors,
                 rateLimit: p.rateLimit,
-                priority: p.priority
+                priority: p.priority,
+                blockHeight: p.blockHeight,
+                lastHealthCheck: p.lastHealthCheck > 0 ? 
+                    new Date(p.lastHealthCheck).toISOString() : 'Never',
+                syncStatus: p.blockHeight > 0 ? 'Synced' : 'Unknown'
             })),
             stats: this.requestStats,
+            cache: {
+                size: this.requestCache.size,
+                activeSessions: this.clientSessions.size
+            },
             timestamp: new Date().toISOString()
         };
     }
@@ -219,7 +448,8 @@ app.use((req, res, next) => {
 // Main RPC endpoint
 app.post('/', async (req, res) => {
     try {
-        const result = await loadBalancer.makeRequest(req.body);
+        const clientIP = req.ip || req.connection.remoteAddress;
+        const result = await loadBalancer.makeRequest(req.body, 3, clientIP);
         res.json(result);
     } catch (error) {
         console.error('RPC request failed:', error.message);
